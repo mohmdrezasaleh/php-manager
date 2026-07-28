@@ -211,6 +211,72 @@ refresh_cagefs() {
     run_cmd "force update"    cagefsctl --force-update
 }
 
+detect_php_installations() {
+    local phpver="$1"
+    PHP_INSTALL_CANDIDATES=()
+    [[ -d "/opt/alt/php${phpver}" ]] && PHP_INSTALL_CANDIDATES+=("alt:/opt/alt/php${phpver}")
+    [[ -d "/opt/cpanel/ea-php${phpver}/root" ]] && PHP_INSTALL_CANDIDATES+=("ea:/opt/cpanel/ea-php${phpver}/root")
+    [[ -d "/usr/local/php${phpver}" ]] && PHP_INSTALL_CANDIDATES+=("native:/usr/local/php${phpver}")
+}
+
+select_php_targets() {
+    local phpver="$1"
+    local allow_native="$2"
+
+    if command -v dnf &>/dev/null; then
+        PKG_MGR="dnf"
+    else
+        PKG_MGR="yum"
+    fi
+
+    detect_php_installations "$phpver"
+
+    if [[ "$allow_native" != "yes" ]]; then
+        local filtered=() c
+        for c in "${PHP_INSTALL_CANDIDATES[@]}"; do
+            [[ "$c" == native:* ]] || filtered+=("$c")
+        done
+        PHP_INSTALL_CANDIDATES=("${filtered[@]}")
+    fi
+
+    if [[ ${#PHP_INSTALL_CANDIDATES[@]} -eq 0 ]]; then
+        err "No package-manageable PHP ${phpver} installation found (checked alt-php and ea-php under /opt)."
+        SELECTED_PHP_TARGETS=()
+        return 1
+    fi
+
+    if [[ ${#PHP_INSTALL_CANDIDATES[@]} -eq 1 ]]; then
+        SELECTED_PHP_TARGETS=("${PHP_INSTALL_CANDIDATES[0]}")
+        local k r
+        IFS=':' read -r k r <<< "${PHP_INSTALL_CANDIDATES[0]}"
+        log "Found one PHP ${phpver} installation: ${BOLD}$r${NC} ${DIM}(${k})${NC}"
+        return 0
+    fi
+
+    warn "Multiple PHP ${phpver} installations found on this server — panel type alone doesn't tell us which one your sites actually use:"
+    local i=1 c k r
+    for c in "${PHP_INSTALL_CANDIDATES[@]}"; do
+        IFS=':' read -r k r <<< "$c"
+        echo -e "  ${CYAN}${i})${NC} $r ${DIM}(${k})${NC}"
+        i=$((i+1))
+    done
+    echo -e "  ${CYAN}a)${NC} All of the above"
+
+    local pick=""
+    while true; do
+        read -rp "$(echo -e "  ${MAGENTA}${BOLD}➜ Select installation number, or 'a' for all${NC}: ")" pick
+        if [[ "$pick" == "a" || "$pick" == "A" ]]; then
+            SELECTED_PHP_TARGETS=("${PHP_INSTALL_CANDIDATES[@]}")
+            return 0
+        fi
+        if [[ "$pick" =~ ^[0-9]+$ ]] && (( pick >= 1 && pick <= ${#PHP_INSTALL_CANDIDATES[@]} )); then
+            SELECTED_PHP_TARGETS=("${PHP_INSTALL_CANDIDATES[$((pick-1))]}")
+            return 0
+        fi
+        err "Invalid selection."
+    done
+}
+
 check_php_environment() {
     local phpver="$1"
     local dir_type="$2"
@@ -584,41 +650,42 @@ install_module_flow() {
     read_php_version "Enter PHP version" PHPVER_RAW
     PHPVER=$(echo "$PHPVER_RAW" | tr -d '.')
 
-    step_header "Detecting Panel & OS"
-    detect_panel_and_os || return 1
+    step_header "Locating PHP Installation(s)"
+    select_php_targets "$PHPVER" "no" || return 1
 
-    if [[ "$PANEL" == "cpanel" ]]; then
-        PKG_PREFIX="ea-php${PHPVER}-php-"
-        PHP_DIR_TYPE="ea"
-    else
-        PKG_PREFIX="alt-php${PHPVER}-"
-        PHP_DIR_TYPE="alt"
-    fi
-
-    step_header "Verifying PHP Environment"
-    check_php_environment "$PHPVER" "$PHP_DIR_TYPE" "$PHPVER_RAW"
-
-    if ! $IS_MANAGED_PHP; then
-        err "Aborting: cannot manage this PHP version through package/selector automation."
-        return 1
-    fi
-
-    if [[ ${#PENDING_MODULES[@]} -gt 1 ]]; then
-        info "Installing ${#PENDING_MODULES[@]} modules is heavier on CageFS than one at a time — consider running this during low-traffic hours."
+    if [[ ${#PENDING_MODULES[@]} -gt 1 || ${#SELECTED_PHP_TARGETS[@]} -gt 1 ]]; then
+        info "Installing across multiple modules/targets is heavier on CageFS — consider running this during low-traffic hours."
     fi
 
     SUCCESSFUL_MODULES=()
     FAILED_MODULES=()
 
-    for mod in "${PENDING_MODULES[@]}"; do
-        MODULE="$mod"
-        if install_one_module_package "$MODULE"; then
-            SUCCESSFUL_MODULES+=("$INSTALLED_MODULE_NAME")
+    local target k r
+    for target in "${SELECTED_PHP_TARGETS[@]}"; do
+        IFS=':' read -r k r <<< "$target"
+
+        step_header "Target: ${r} (${k})"
+
+        if [[ "$k" == "ea" ]]; then
+            PANEL="cpanel"
+            PKG_PREFIX="ea-php${PHPVER}-php-"
         else
-            FAILED_MODULES+=("$mod")
+            PANEL="directadmin"
+            PKG_PREFIX="alt-php${PHPVER}-"
         fi
+
+        for mod in "${PENDING_MODULES[@]}"; do
+            MODULE="$mod"
+            if install_one_module_package "$MODULE"; then
+                SUCCESSFUL_MODULES+=("$INSTALLED_MODULE_NAME")
+            else
+                FAILED_MODULES+=("$mod (${k})")
+            fi
+        done
     done
 
+    check_cagefs_status
+    check_is_cloudlinux
     run_post_install_tasks SUCCESSFUL_MODULES "$PHPVER_RAW"
 
     separator
@@ -880,34 +947,50 @@ install_loaders_flow() {
     read_php_version "Enter PHP version" PHPVER_RAW
     PHPVER=$(echo "$PHPVER_RAW" | tr -d '.')
 
-    step_header "Detecting Panel & OS"
-    detect_panel_and_os || return 1
+    step_header "Locating PHP Installation(s)"
+    info "ionCube/SourceGuardian packages exist for both alt-php and ea-php — checking both."
+    select_php_targets "$PHPVER" "no" || return 1
 
-    PKG_PREFIX="alt-php${PHPVER}-"
+    local overall_installed_any=false
 
-    step_header "Verifying PHP Environment"
-    info "ionCube/SourceGuardian are always packaged under alt-phpXX, regardless of panel."
-    check_php_environment "$PHPVER" "alt" "$PHPVER_RAW"
+    local target k r
+    for target in "${SELECTED_PHP_TARGETS[@]}"; do
+        IFS=':' read -r k r <<< "$target"
 
-    if ! $IS_MANAGED_PHP; then
-        err "Aborting: PHP ${PHPVER_RAW} is not an alt-php installation (no ${MANAGED_PHP_DIR})."
-        info "ionCube/SourceGuardian via alt-phpXX-* packages only apply to alt-php, not native PHP."
+        step_header "Target: ${r} (${k})"
+
+        if [[ "$k" == "ea" ]]; then
+            PKG_PREFIX="ea-php${PHPVER}-php-"
+        else
+            PKG_PREFIX="alt-php${PHPVER}-"
+        fi
+
+        for pkg_suffix in "${LOADERS[@]}"; do
+            FULL_PKG="${PKG_PREFIX}${pkg_suffix}"
+
+            info "Installing ${FULL_PKG}"
+
+            if rpm -q "$FULL_PKG" &>/dev/null; then
+                log "Already installed: ${BOLD}$FULL_PKG${NC}"
+                overall_installed_any=true
+                continue
+            fi
+
+            if install_package_with_testing_fallback "$FULL_PKG" "yes"; then
+                overall_installed_any=true
+            else
+                warn "Failed to install $FULL_PKG on this target (may simply not be offered for ${k}-php). Skipping."
+            fi
+        done
+    done
+
+    if ! $overall_installed_any; then
+        err "No loader packages could be installed on any detected target."
         return 1
     fi
 
-    for pkg_suffix in "${LOADERS[@]}"; do
-        FULL_PKG="${PKG_PREFIX}${pkg_suffix}"
-
-        step_header "Installing ${FULL_PKG}"
-
-        if rpm -q "$FULL_PKG" &>/dev/null; then
-            log "Already installed: ${BOLD}$FULL_PKG${NC}"
-            continue
-        fi
-
-        install_package_with_testing_fallback "$FULL_PKG" "yes" || err "Failed to install $FULL_PKG. Skipping."
-    done
-
+    check_cagefs_status
+    check_is_cloudlinux
     run_post_install_tasks SELECTOR_NAMES "$PHPVER_RAW"
 
     separator
@@ -916,6 +999,29 @@ install_loaders_flow() {
 }
 
 ZEND_EXTENSION_MODULES=("ioncube_loader" "sourceguardian")
+
+declare -A MODULE_VERIFY_PATTERNS=(
+    [opcache]="opcache"
+    [ioncube_loader]="ioncube"
+    [sourceguardian]="sourceguardian"
+)
+
+verify_module_loaded() {
+    local php_bin="$1" module="$2"
+
+    if [[ ! -x "$php_bin" ]]; then
+        return 2
+    fi
+
+    local pattern="${MODULE_VERIFY_PATTERNS[$module]:-}"
+    if [[ -n "$pattern" ]]; then
+        "$php_bin" -m 2>/dev/null | grep -qi "$pattern" && return 0
+        "$php_bin" -v 2>/dev/null | grep -qi "$pattern" && return 0
+        return 1
+    fi
+
+    "$php_bin" -m 2>/dev/null | grep -qi "^${module}$"
+}
 
 is_zend_extension_module() {
     local mod="$1"
@@ -1023,10 +1129,8 @@ manual_extension_flow() {
 
     step_header "Locating PHP Installation"
 
-    local candidates=()
-    [[ -d "/opt/alt/php${phpver}" ]] && candidates+=("alt:/opt/alt/php${phpver}")
-    [[ -d "/opt/cpanel/ea-php${phpver}/root" ]] && candidates+=("ea:/opt/cpanel/ea-php${phpver}/root")
-    [[ -d "/usr/local/php${phpver}" ]] && candidates+=("native:/usr/local/php${phpver}")
+    detect_php_installations "$phpver"
+    local candidates=("${PHP_INSTALL_CANDIDATES[@]}")
 
     if [[ ${#candidates[@]} -eq 0 ]]; then
         err "No PHP ${PHPVER_RAW} installation found under /opt/alt, /opt/cpanel/ea-php*, or /usr/local."
@@ -1069,7 +1173,7 @@ manual_extension_flow() {
         php_bin="${chosen_root}/usr/bin/php"
     fi
 
-    if [[ -x "$php_bin" ]] && "$php_bin" -m 2>/dev/null | grep -qi "^${module}$"; then
+    if verify_module_loaded "$php_bin" "$module"; then
         log "${BOLD}${GREEN}'$module' is already active on PHP ${PHPVER_RAW} — nothing to do.${NC}"
         return 0
     fi
@@ -1141,7 +1245,7 @@ manual_extension_flow() {
                 return 1
             fi
 
-            if [[ -x "$php_bin" ]] && "$php_bin" -m 2>/dev/null | grep -qi "^${module}$"; then
+            if verify_module_loaded "$php_bin" "$module"; then
                 log "${BOLD}${GREEN}'$module' is already active after the package install — nothing more to do.${NC}"
                 audit_log "Installed '${module}' (PHP ${PHPVER_RAW}) via manual mode; package already activated it"
                 return 0
@@ -1197,10 +1301,10 @@ manual_extension_flow() {
     step_header "Verifying"
 
     if [[ -x "$php_bin" ]]; then
-        if "$php_bin" -m 2>/dev/null | grep -qi "^${module}$"; then
+        if verify_module_loaded "$php_bin" "$module"; then
             log "${BOLD}${GREEN}'$module' is now active on PHP ${PHPVER_RAW}.${NC}"
         else
-            err "'$module' still not showing in 'php -m' after writing the ini."
+            err "'$module' still not showing in 'php -m'/'php -v' after writing the ini."
             warn "Reverting — this configuration doesn't seem to work for this build."
             if [[ -n "$backup" && -f "$backup" ]]; then
                 mv "$backup" "$ini_file"
