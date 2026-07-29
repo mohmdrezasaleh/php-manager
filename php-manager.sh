@@ -345,7 +345,7 @@ show_modules_menu() {
         i=$((i+1))
     done
     echo ""
-    info "Not listed? Just type the module name directly ${DIM}(e.g. dom's real package is often 'xml')${NC}."
+    info "Not listed? Type the exact extension name (e.g. dom, xmlreader, mysqli) — the script finds its real package automatically, even if it's named differently. Never type a package-only name like 'xml' directly; it isn't a valid extension name by itself."
 }
 
 select_module_from_list() {
@@ -374,6 +374,12 @@ select_module_from_list() {
 
 enable_selector_extension() {
     local mod="$1" ver="$2" scope="$3" username="$4"
+
+    if [[ "$mod" == "xml" ]]; then
+        warn "'xml' is a package name, not a real selector extension — using 'dom' instead (the most common case)."
+        mod="dom"
+    fi
+
     local candidates
     read -ra candidates <<< "$(resolve_selector_candidates "$mod")"
 
@@ -388,6 +394,17 @@ enable_selector_extension() {
         else
             echo -en "${DIM}(user: $username)${NC} ... "
             selectorctl --enable-user-extensions="$ext" --version="$ver" --user="$username" &>"$LOGFILE" || SEL_EXIT=$?
+        fi
+
+        if grep -qi "No such extension" "$LOGFILE"; then
+            echo -e "${RED}invalid extension name${NC}"
+            local valid_list
+            valid_list=$(grep -i "available extensions" "$LOGFILE" | sed -E 's/.*available extensions is: *//i')
+            err "'${ext}' is not a real selector extension name on this system."
+            if [[ -n "$valid_list" ]]; then
+                info "Valid names include: ${valid_list}"
+            fi
+            return 1
         fi
 
         local total_lines conflict_lines
@@ -1173,86 +1190,93 @@ manual_extension_flow() {
         php_bin="${chosen_root}/usr/bin/php"
     fi
 
+    local skip_ini_write=false
+    local so_path=""
+
     if verify_module_loaded "$php_bin" "$module"; then
-        log "${BOLD}${GREEN}'$module' is already active on PHP ${PHPVER_RAW} — nothing to do.${NC}"
-        return 0
+        log "${BOLD}${GREEN}'$module' is already active at the PHP binary level on ${PHPVER_RAW}.${NC}"
+        info "This does NOT necessarily mean it's enabled for every hosting account — continuing to the per-account enable step."
+        skip_ini_write=true
     fi
 
-    step_header "Locating .so File"
+    if ! $skip_ini_write; then
+        step_header "Locating .so File"
 
-    local so_path
-    so_path=$(find "$chosen_root" -iname "${module}.so" 2>/dev/null | head -n1)
+        so_path=$(find "$chosen_root" -iname "${module}.so" 2>/dev/null | head -n1)
 
-    if [[ -z "$so_path" ]]; then
-        warn "'${module}.so' was not found anywhere under $chosen_root."
+        if [[ -z "$so_path" ]]; then
+            warn "'${module}.so' was not found anywhere under $chosen_root."
 
-        if [[ "$chosen_kind" == "native" ]]; then
-            if is_zend_extension_module "$module"; then
-                info "No prebuilt loader found on disk, but ${module} is distributed as an official precompiled binary (no compilation needed)."
-                read -rp "$(echo -e "  ${YELLOW}${BOLD}➜ Download and install the official loader now?${NC} ${DIM}(y/n)${NC}: ")" try_download
-                if [[ "$try_download" != "y" && "$try_download" != "Y" ]]; then
+            if [[ "$chosen_kind" == "native" ]]; then
+                if is_zend_extension_module "$module"; then
+                    info "No prebuilt loader found on disk, but ${module} is distributed as an official precompiled binary (no compilation needed)."
+                    read -rp "$(echo -e "  ${YELLOW}${BOLD}➜ Download and install the official loader now?${NC} ${DIM}(y/n)${NC}: ")" try_download
+                    if [[ "$try_download" != "y" && "$try_download" != "Y" ]]; then
+                        info "Cancelled."
+                        return 0
+                    fi
+
+                    if download_native_loader "$module" "$PHPVER_RAW" "$chosen_root"; then
+                        so_path="$NATIVE_LOADER_SO_PATH"
+                    else
+                        err "Automatic download/install failed."
+                        info "Manual fallback — download yourself and place under ${chosen_root}, then run this option again:"
+                        info "ionCube: https://www.ioncube.com/loaders.php"
+                        info "SourceGuardian: https://www.sourceguardian.com/loaders/"
+                        return 1
+                    fi
+                else
+                    err "This is a native PHP build — there's no package manager to install extensions from."
+                    info "Non-loader extensions (like '${module}') need to be compiled from source (PECL) to match this exact PHP build."
+                    info "This script can't safely automate that — install it manually, then run this option again to write the ini."
+                    return 1
+                fi
+            else
+                read -rp "$(echo -e "  ${YELLOW}${BOLD}➜ Try to find and install a package for '${module}' now?${NC} ${DIM}(y/n)${NC}: ")" try_install
+                if [[ "$try_install" != "y" && "$try_install" != "Y" ]]; then
                     info "Cancelled."
                     return 0
                 fi
 
-                if download_native_loader "$module" "$PHPVER_RAW" "$chosen_root"; then
-                    so_path="$NATIVE_LOADER_SO_PATH"
+                if command -v dnf &>/dev/null; then
+                    PKG_MGR="dnf"
                 else
-                    err "Automatic download/install failed."
-                    info "Manual fallback — download yourself and place under ${chosen_root}, then run this option again:"
-                    info "ionCube: https://www.ioncube.com/loaders.php"
-                    info "SourceGuardian: https://www.sourceguardian.com/loaders/"
+                    PKG_MGR="yum"
+                fi
+
+                PHPVER="$phpver"
+                if [[ "$chosen_kind" == "ea" ]]; then
+                    PANEL="cpanel"
+                    PKG_PREFIX="ea-php${phpver}-php-"
+                else
+                    PANEL="directadmin"
+                    PKG_PREFIX="alt-php${phpver}-"
+                fi
+
+                install_one_module_package "$module" || {
+                    err "Could not install a package for '$module'. Nothing more manual mode can automate here."
+                    return 1
+                }
+
+                so_path=$(find "$chosen_root" -iname "${module}.so" 2>/dev/null | head -n1)
+
+                if [[ -z "$so_path" ]]; then
+                    err "Package installed, but no '${module}.so' file was found afterward."
+                    info "This module may be compiled into a different core file, or the package uses a different .so name."
                     return 1
                 fi
-            else
-                err "This is a native PHP build — there's no package manager to install extensions from."
-                info "Non-loader extensions (like '${module}') need to be compiled from source (PECL) to match this exact PHP build."
-                info "This script can't safely automate that — install it manually, then run this option again to write the ini."
-                return 1
-            fi
-        else
-            read -rp "$(echo -e "  ${YELLOW}${BOLD}➜ Try to find and install a package for '${module}' now?${NC} ${DIM}(y/n)${NC}: ")" try_install
-            if [[ "$try_install" != "y" && "$try_install" != "Y" ]]; then
-                info "Cancelled."
-                return 0
-            fi
 
-            if command -v dnf &>/dev/null; then
-                PKG_MGR="dnf"
-            else
-                PKG_MGR="yum"
-            fi
-
-            PHPVER="$phpver"
-            if [[ "$chosen_kind" == "ea" ]]; then
-                PANEL="cpanel"
-                PKG_PREFIX="ea-php${phpver}-php-"
-            else
-                PANEL="directadmin"
-                PKG_PREFIX="alt-php${phpver}-"
-            fi
-
-            install_one_module_package "$module" || {
-                err "Could not install a package for '$module'. Nothing more manual mode can automate here."
-                return 1
-            }
-
-            so_path=$(find "$chosen_root" -iname "${module}.so" 2>/dev/null | head -n1)
-
-            if [[ -z "$so_path" ]]; then
-                err "Package installed, but no '${module}.so' file was found afterward."
-                info "This module may be compiled into a different core file, or the package uses a different .so name."
-                return 1
-            fi
-
-            if verify_module_loaded "$php_bin" "$module"; then
-                log "${BOLD}${GREEN}'$module' is already active after the package install — nothing more to do.${NC}"
-                audit_log "Installed '${module}' (PHP ${PHPVER_RAW}) via manual mode; package already activated it"
-                return 0
+                if verify_module_loaded "$php_bin" "$module"; then
+                    log "${BOLD}${GREEN}'$module' is already active after the package install.${NC}"
+                    info "This does NOT necessarily mean it's enabled for every hosting account — continuing to the per-account enable step."
+                    audit_log "Installed '${module}' (PHP ${PHPVER_RAW}) via manual mode; package already activated it"
+                    skip_ini_write=true
+                fi
             fi
         fi
     fi
 
+    if ! $skip_ini_write; then
     log "Found: ${BOLD}$so_path${NC}"
 
     local directive="extension"
@@ -1320,10 +1344,15 @@ manual_extension_flow() {
     fi
 
     audit_log "Manually enabled '${module}' (PHP ${PHPVER_RAW}) via ${ini_file} [${chosen_kind}]"
+    fi
 
     if [[ "$chosen_kind" == "native" ]]; then
-        warn "Native PHP build — no CageFS/selectorctl involved here."
-        info "Restart your web server to apply the change, e.g.: systemctl restart httpd  (or lsws)"
+        if $skip_ini_write; then
+            log "${BOLD}${GREEN}'$module' is already active — no changes needed on this native PHP build.${NC}"
+        else
+            warn "Native PHP build — no CageFS/selectorctl involved here."
+            info "Restart your web server to apply the change, e.g.: systemctl restart httpd  (or lsws)"
+        fi
     else
         check_cagefs_status
         check_is_cloudlinux
